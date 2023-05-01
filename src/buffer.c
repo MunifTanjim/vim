@@ -4174,6 +4174,8 @@ typedef struct
     char_u	*stl_start;
     int		stl_minwid;
     int		stl_maxwid;
+    int         stl_priority;
+    int         stl_len;
     enum {
 	Normal,
 	Empty,
@@ -4191,6 +4193,9 @@ static int	       *stl_groupitem = NULL;
 static stl_hlrec_T     *stl_hltab = NULL;
 static stl_hlrec_T     *stl_tabtab = NULL;
 static int		*stl_separator_locations = NULL;
+static stl_item_T      **stl_pitems = NULL;
+static int		stl_priority[10] = {};
+
 
 /*
  * Build a string from the status line items in "fmt".
@@ -4233,10 +4238,11 @@ build_stl_str_hl(
 #endif
     int		empty_line;
     colnr_T	virtcol;
-    long	l;
+    long	l;		// location
     long	n;
     int		prevchar_isflag;
     int		prevchar_isitem;
+    int		priority_truncation = FALSE;
     int		itemisflag;
     int		fillable;
     char_u	*str;
@@ -4284,7 +4290,10 @@ build_stl_str_hl(
 	stl_tabtab = ALLOC_MULT(stl_hlrec_T, stl_items_len + 1);
 
 	stl_separator_locations = ALLOC_MULT(int, stl_items_len);
+	stl_pitems = ALLOC_MULT(stl_item_T *, stl_items_len);
     }
+
+    vim_memset(stl_priority, 0, 10);
 
 #ifdef FEAT_EVAL
     // if "fmt" was set insecurely it needs to be evaluated in the sandbox
@@ -4382,6 +4391,12 @@ build_stl_str_hl(
 		break;
 	    stl_separator_locations = new_separator_locs;;
 
+	    stl_item_T **new_pitems = vim_realloc(stl_pitems,
+					  sizeof(stl_item_T *) * stl_items_len);
+	    if (new_pitems == NULL)
+		break;
+	    stl_pitems = new_pitems;
+
 	    stl_items_len = new_len;
 	}
 
@@ -4423,8 +4438,35 @@ build_stl_str_hl(
 	if (*s == STL_TRUNCMARK)
 	{
 	    s++;
-	    stl_items[curitem].stl_type = Trunc;
-	    stl_items[curitem++].stl_start = p;
+	    if (VIM_ISDIGIT(*s))
+	    {
+		minwid = (int)getdigits(&s);
+		if (minwid < 0)	// overflow
+		    minwid = 0;
+		stl_items[curitem].stl_priority = minwid > 9 ? 9 : minwid;
+		stl_priority[stl_items[curitem].stl_priority]++;
+
+		if (!priority_truncation) {
+		    priority_truncation = TRUE;
+		    for (int i = 0; i < curitem; i++)
+		    {
+			if (stl_items[i].stl_type == Trunc)
+			    stl_items[i++].stl_type = Empty;
+			stl_items[i].stl_priority = 0;
+			stl_priority[0]++;
+		    }
+		}
+	    }
+	    else if (priority_truncation)
+	    {
+		stl_items[curitem].stl_priority = minwid > 9 ? 9 : minwid;
+		stl_priority[stl_items[curitem].stl_priority]++;
+	    }
+	    else
+	    {
+		stl_items[curitem].stl_type = Trunc;
+		stl_items[curitem++].stl_start = p;
+	    }
 	    continue;
 	}
 	if (*s == ')')
@@ -5046,89 +5088,110 @@ build_stl_str_hl(
     width = vim_strsize(out);
     if (maxwidth > 0 && width > maxwidth)
     {
-	// Result is too long, must truncate somewhere.
-	l = 0;
-	if (itemcnt == 0)
-	    s = out;
-	else
+	if (priority_truncation)
 	{
-	    for ( ; l < itemcnt; l++)
-		if (stl_items[l].stl_type == Trunc)
-		{
-		    // Truncate at %< item.
-		    s = stl_items[l].stl_start;
-		    break;
-		}
-	    if (l == itemcnt)
+	    for (int i = 1; i < 10; i++)
+		stl_priority[i] += stl_priority[i-1];
+
+	    for (int i = 10 - 1; i >= 0; i--)
 	    {
-		// No %< item, truncate first item.
-		s = stl_items[0].stl_start;
-		l = 0;
+		stl_pitems[stl_priority[stl_items[i].stl_priority]-1] = &stl_items[i];
+		stl_priority[stl_items[i].stl_priority]--;
+	    }
+
+	    for (l = 0; l < itemcnt; l++)
+	    {
+		// if (stl_pitems[l]->stl_type == Trunc)
+		// {
+		// }
 	    }
 	}
-
-	if (width - vim_strsize(s) >= maxwidth)
+	else
 	{
-	    // Truncation mark is beyond max length
-	    if (has_mbyte)
-	    {
+	    // Result is too long, must truncate somewhere.
+	    l = 0;
+	    if (itemcnt == 0)
 		s = out;
-		width = 0;
-		for (;;)
-		{
-		    width += ptr2cells(s);
-		    if (width >= maxwidth)
+	    else
+	    {
+		for ( ; l < itemcnt; l++)
+		    if (stl_items[l].stl_type == Trunc)
+		    {
+			// Truncate at %< item.
+			s = stl_items[l].stl_start;
 			break;
-		    s += (*mb_ptr2len)(s);
+		    }
+		if (l == itemcnt)
+		{
+		    // No %< item, truncate first item.
+		    s = stl_items[0].stl_start;
+		    l = 0;
 		}
+	    }
+
+	    if (width - vim_strsize(s) >= maxwidth)
+	    {
+		// Truncation mark is beyond max length
+		if (has_mbyte)
+		{
+		    s = out;
+		    width = 0;
+		    for (;;)
+		    {
+			width += ptr2cells(s);
+			if (width >= maxwidth)
+			    break;
+			s += (*mb_ptr2len)(s);
+		    }
+		    // Fill up for half a double-wide character.
+		    while (++width < maxwidth)
+			MB_CHAR2BYTES(fillchar, s);
+		}
+		else
+		    s = out + maxwidth - 1;
+		for (l = 0; l < itemcnt; l++)
+		    if (stl_items[l].stl_start > s)
+			break;
+		itemcnt = l;
+		*s++ = '>';
+		*s = 0;
+	    }
+	    else
+	    {
+		if (has_mbyte)
+		{
+		    n = 0;
+		    while (width >= maxwidth)
+		    {
+			width -= ptr2cells(s + n);
+			n += (*mb_ptr2len)(s + n);
+		    }
+		}
+		else
+		    n = width - maxwidth + 1;
+		p = s + n;
+		STRMOVE(s + 1, p);
+		*s = '<';
+
 		// Fill up for half a double-wide character.
 		while (++width < maxwidth)
-		    MB_CHAR2BYTES(fillchar, s);
-	    }
-	    else
-		s = out + maxwidth - 1;
-	    for (l = 0; l < itemcnt; l++)
-		if (stl_items[l].stl_start > s)
-		    break;
-	    itemcnt = l;
-	    *s++ = '>';
-	    *s = 0;
-	}
-	else
-	{
-	    if (has_mbyte)
-	    {
-		n = 0;
-		while (width >= maxwidth)
 		{
-		    width -= ptr2cells(s + n);
-		    n += (*mb_ptr2len)(s + n);
+		    s = s + STRLEN(s);
+		    MB_CHAR2BYTES(fillchar, s);
+		    *s = NUL;
+		}
+
+		--n;	// count the '<'
+		for (; l < itemcnt; l++)
+		{
+		    if (stl_items[l].stl_start - n >= s)
+			stl_items[l].stl_start -= n;
+		    else
+			stl_items[l].stl_start = s;
 		}
 	    }
-	    else
-		n = width - maxwidth + 1;
-	    p = s + n;
-	    STRMOVE(s + 1, p);
-	    *s = '<';
-
-	    // Fill up for half a double-wide character.
-	    while (++width < maxwidth)
-	    {
-		s = s + STRLEN(s);
-		MB_CHAR2BYTES(fillchar, s);
-		*s = NUL;
-	    }
-
-	    --n;	// count the '<'
-	    for (; l < itemcnt; l++)
-	    {
-		if (stl_items[l].stl_start - n >= s)
-		    stl_items[l].stl_start -= n;
-		else
-		    stl_items[l].stl_start = s;
-	    }
+	    width = maxwidth;
 	}
-	width = maxwidth;
     }
     else if (width < maxwidth && STRLEN(out) + maxwidth - width + 1 < outlen)
     {
